@@ -1,7 +1,18 @@
 import Dexie, { type Table } from "dexie";
 
 export type WusoolHistoryEntry = { amount: number; date: string; note?: string };
-export type WusoolSyncPayload = { amount: number; note?: string; date: string; customerLocalId?: string };
+export type WusoolSyncPayload = { 
+  amount: number; 
+  note?: string; 
+  date: string; 
+  customerLocalId: string;
+  customerName?: string;
+};
+export type DeleteCustomerPayload = {
+  action: "delete";
+  customerId: string;
+  localId: string;
+};
 export type EasyType = "send" | "receive" | "bill" | "easyload" | "jazzcash" | "deposit" | "withdraw";
 export type SaleCategory = "mobile_accessories" | "manyari" | "cosmetics" | "other" | "general";
 
@@ -15,7 +26,7 @@ export interface OfflineSale {
   localId: string; _id?: string; productId: string; productName: string;
   category: SaleCategory; quantity: number; sellPrice: number; buyPrice: number;
   buyPriceAvg: number; total: number; profit: number; customerName: string;
-  paymentType: "cash" | "credit"; status: "paid" | "pending"; userId: string;
+  paymentType: "cash" | "credit"; status: "paid" | "pending" | "deleted"; userId: string;
   createdAt: string; synced: number; customerId?: string;
 }
 export interface OfflineCustomer {
@@ -30,10 +41,25 @@ export interface OfflineEasypaisa {
   amount: number; commission: number; totalAmount: number; userId: string;
   createdAt: string; synced: number;
 }
-export type OfflinePayload = OfflineSale | OfflineProduct | OfflineCustomer | WusoolSyncPayload | OfflineEasypaisa;
+export interface PendingReturn {
+  id?: number;
+  saleId: string;
+  newQty: number;
+  retQty: number;
+  productId: string;
+  createdAt: string;
+  synced: number;
+}
+export type OfflinePayload = OfflineSale | OfflineProduct | OfflineCustomer | WusoolSyncPayload | OfflineEasypaisa | DeleteCustomerPayload;
+export type SyncQueueType = "sale" | "product" | "customer" | "wusool" | "easypaisa" | "return" | "delete_customer";
+
 export interface SyncQueueItem {
-  id?: number; type: "sale" | "product" | "customer" | "wusool" | "easypaisa";
-  localId: string; payload: OfflinePayload; createdAt: Date; attempts: number;
+  id?: number; 
+  type: SyncQueueType;
+  localId: string; 
+  payload: OfflinePayload | PendingReturn; 
+  createdAt: Date; 
+  attempts: number;
 }
 
 type LegacyProductForMigration = {
@@ -51,6 +77,7 @@ export class OfflineDB extends Dexie {
   customers!: Table<OfflineCustomer, string>;
   easypaisa!: Table<OfflineEasypaisa, string>;
   syncQueue!: Table<SyncQueueItem, number>;
+  pendingReturns!: Table<PendingReturn, number>;
 
   constructor() {
     super("AsadStoreOfflineV2");
@@ -92,7 +119,6 @@ export class OfflineDB extends Dexie {
       syncQueue: "++id, type, localId, createdAt",
     });
 
-    // ✅ V7: barcode + general category
     this.version(7).stores({
       products: "localId, _id, userId, synced, name, category, barcode, createdAt",
       sales: "localId, _id, productId, userId, synced, createdAt, customerName, status, category, paymentType",
@@ -102,10 +128,16 @@ export class OfflineDB extends Dexie {
     }).upgrade((tx) => {
       return tx.table("products").toCollection().modify((p: LegacyProductForMigration) => {
         if (!p.barcode) p.barcode = "";
-        if (p.category === "other" || !p.category) {
-          // keep as is, general will be new default going forward
-        }
       });
+    });
+
+    this.version(8).stores({
+      products: "localId, _id, userId, synced, name, category, barcode, createdAt",
+      sales: "localId, _id, productId, userId, synced, createdAt, customerName, status, category, paymentType",
+      customers: "localId, _id, name, normalizedName, userId, synced, totalUdhar, isPaid, createdAt",
+      easypaisa: "localId, _id, userId, synced, createdAt, type, customerName",
+      syncQueue: "++id, type, localId, createdAt",
+      pendingReturns: "++id, saleId, synced, createdAt",
     });
   }
 }
@@ -167,8 +199,19 @@ export async function addOfflineWusool(customerLocalId: string, amount: number, 
   }
   await offlineDB.syncQueue.add({
     type: "wusool", localId: customerLocalId,
-    payload: { amount: paid, note, date: entry.date, customerLocalId },
+    payload: { amount: paid, note, date: entry.date, customerLocalId, customerName: customer.name },
     createdAt: new Date(), attempts: 0,
   });
   return entry;
+}
+
+export async function savePendingReturn(saleId: string, newQty: number, retQty: number, productId: string): Promise<void> {
+  await offlineDB.pendingReturns.add({
+    saleId,
+    newQty,
+    retQty,
+    productId,
+    createdAt: new Date().toISOString(),
+    synced: 0,
+  });
 }
