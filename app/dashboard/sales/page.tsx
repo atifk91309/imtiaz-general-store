@@ -30,6 +30,10 @@ function toCat(c: string | undefined): Category {
   if(c==="mobile_accessories" || c==="manyari" || c==="cosmetics" || c==="other" || c==="general") return c;
   return "general";
 }
+// ✅ NEW: barcode normalize for offline search - fixes "8 964001 050773" and "led-0502001-glow"
+function normalizeBarcode(s: string){
+  return s.toString().trim().toLowerCase().replace(/\s+/g, "").replace(/-/g, "");
+}
 
 export default function SalesPage(){
   const [sales, setSales] = useState<Sale[]>([]);
@@ -77,7 +81,6 @@ export default function SalesPage(){
     }catch{} 
   },[]);
 
-  // ✅ FIXED: server _id save + deleted skip
   const syncPendingSales = useCallback(async()=>{
     try{
       if(!navigator.onLine) return;
@@ -149,13 +152,25 @@ export default function SalesPage(){
       try{
         if(!navigator.onLine){
           const cached=await offlineDB.products.toArray();
-          const cleanSearch = productSearch.trim();
-          const filtered=cached.filter((c)=>{ 
-            const s=cleanSearch.toLowerCase(); 
-            if(!s) return true;
-            const bar = (c.barcode||"").toLowerCase();
-            return c.name.toLowerCase().includes(s) || bar === s || bar.includes(s) || s.includes(bar);
-          });
+const cleanSearch = productSearch.trim();
+const sLower = cleanSearch.toLowerCase();
+const sNorm = normalizeBarcode(cleanSearch);
+
+const filtered=cached.filter((c)=>{ 
+  if(!cleanSearch) return true;
+  const nameLower = c.name.toLowerCase();
+  const barNorm = normalizeBarcode(c.barcode||"");
+  if(!barNorm) return nameLower.includes(sLower); // khali barcode wale sirf name se
+  return barNorm === sNorm || barNorm.includes(sNorm) || nameLower.includes(sLower);
+});
+// exact barcode ko first pe lao
+filtered.sort((a,b)=>{
+  const aNorm = normalizeBarcode(a.barcode||"");
+  const bNorm = normalizeBarcode(b.barcode||"");
+  if(aNorm === sNorm) return -1;
+  if(bNorm === sNorm) return 1;
+  return 0;
+});
           const filteredByCat = categoryFilter==="all" ? filtered : filtered.filter(c=> c.category===categoryFilter);
           const LIMIT = 20; const paged = filteredByCat.slice(0, productPage * LIMIT);
           const mapped: Product[] = paged.map((c)=>({ _id:c._id||c.localId, name:c.name, category:toCat(c.category), buyPrice:c.buyPriceAvg||c.buyPrice, buyPriceAvg:c.buyPriceAvg||c.buyPrice, sellPrice:c.sellPrice, stock:c.stock, stockMode:c.stockMode||"limited", barcode: c.barcode }));
@@ -239,44 +254,74 @@ export default function SalesPage(){
   },[paymentType, customerName, getFinalPrice]);
 
   useEffect(()=>{
-    if(products.length===0) return;
     let buffer = "";
     let bufferStartTime = 0;
     let lastTime = 0;
     let lastScannedCode = "";
     let lastScanTime = 0;
-    const extractRealCode = (raw: string): string => {
-      const code = raw.trim();
-      if(!code) return "";
-      const suffixMatch = products.find(p => p.barcode && code.toLowerCase().endsWith(p.barcode.toLowerCase()));
-      if(suffixMatch?.barcode) return suffixMatch.barcode;
-      if(/^\d+$/.test(code) && code.length > 16) return code.slice(-13);
-      return code;
-    };
-    const tryAdd = (code:string, elapsed: number)=>{
-      const cleanCode = extractRealCode(code);
-      if(!cleanCode || cleanCode.length < 2) return;
-      if(elapsed > 800) return;
+
+    const tryAdd = async (rawCode:string, elapsed: number)=>{
+      if(!rawCode || rawCode.length < 2 || elapsed > 800) return;
+      const codeNorm = normalizeBarcode(rawCode);
       const now = Date.now();
-      if(cleanCode.toLowerCase() === lastScannedCode.toLowerCase() && (now - lastScanTime) < 1000) return;
-      lastScannedCode = cleanCode.toLowerCase();
-      lastScanTime = now;
-      const found = products.find(p=> p.barcode && p.barcode.toLowerCase() === cleanCode.toLowerCase());
-      const isSearchFocused = document.activeElement === searchRef.current;
-      if(isSearchFocused){
-        setProductSearch(cleanCode);
-        setProductPage(1);
-      } else {
-        if(found){
-          addToCart(found,1);
-          try{ navigator.vibrate?.(100); }catch{}
-          setProductSearch("");
+      if(codeNorm === normalizeBarcode(lastScannedCode) && (now - lastScanTime) < 1000) return;
+
+      try{
+        const all = await offlineDB.products.toArray();
+        
+        // concatenated "led-0502001-glow8964001050773" ko handle
+        const candidates = all.map(p=> ({ p, bNorm: normalizeBarcode(p.barcode||"") }))
+          .filter(x=> x.bNorm && codeNorm.includes(x.bNorm))
+          .sort((a,b)=>{
+            const aIdx = codeNorm.lastIndexOf(a.bNorm);
+            const bIdx = codeNorm.lastIndexOf(b.bNorm);
+            if(aIdx !== bIdx) return bIdx - aIdx; // jo last me aaya wohi naya scan
+            return b.bNorm.length - a.bNorm.length;
+          });
+
+        let finalBarcode = "";
+        let foundProd: Product | null = null;
+
+        if(candidates.length > 0){
+          finalBarcode = candidates[0].p.barcode || candidates[0].bNorm;
+          const f = candidates[0].p;
+          foundProd = { _id: f._id||f.localId, name: f.name, category: toCat(f.category), buyPrice: f.buyPriceAvg||f.buyPrice, buyPriceAvg: f.buyPriceAvg||f.buyPrice, sellPrice: f.sellPrice, stock: f.stock, stockMode: f.stockMode||"limited", barcode: f.barcode };
         } else {
-          setProductSearch(cleanCode);
-          setProductPage(1);
+          // agar direct match nahi to last 13 digit numeric try
+          if(/^\d+$/.test(codeNorm) && codeNorm.length > 13){
+            const last = codeNorm.slice(-13);
+            const byLast = all.find(p=> normalizeBarcode(p.barcode||"") === last);
+            if(byLast){ 
+              finalBarcode = byLast.barcode || last;
+              foundProd = { _id: byLast._id||byLast.localId, name: byLast.name, category: toCat(byLast.category), buyPrice: byLast.buyPriceAvg||byLast.buyPrice, buyPriceAvg: byLast.buyPriceAvg||byLast.buyPrice, sellPrice: byLast.sellPrice, stock: byLast.stock, stockMode: byLast.stockMode||"limited", barcode: byLast.barcode };
+            }
+          }
         }
-      }
+
+        if(!finalBarcode) finalBarcode = rawCode.slice(-25); // fallback
+
+        lastScannedCode = finalBarcode;
+        lastScanTime = now;
+
+        const isSearchFocused = document.activeElement === searchRef.current;
+
+        if(isSearchFocused){
+          // ✅ search pe ho to sirf overwrite karke product dikhao
+          setProductSearch(finalBarcode);
+          setProductPage(1);
+        } else {
+          if(foundProd){
+            addToCart(foundProd, 1);
+            try{ navigator.vibrate?.(100); }catch{}
+            setProductSearch("");
+          } else {
+            setProductSearch(finalBarcode);
+            setProductPage(1);
+          }
+        }
+      }catch{}
     };
+
     const onKeyDown = (e: KeyboardEvent)=>{
       if((e.target as HTMLElement) === customerInputRef.current) return;
       const now = Date.now();
@@ -287,19 +332,19 @@ export default function SalesPage(){
           const elapsed = now - bufferStartTime;
           const code = buffer.trim();
           buffer = "";
-          tryAdd(code, elapsed);
+          void tryAdd(code, elapsed);
           e.preventDefault();
           e.stopPropagation();
         } else { buffer = ""; }
       } else if(e.key.length === 1){
         if(buffer.length === 0) bufferStartTime = now;
         buffer += e.key;
-        if(buffer.length > 50) buffer = buffer.slice(-50);
+        if(buffer.length > 80) buffer = buffer.slice(-80);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return ()=> window.removeEventListener("keydown", onKeyDown);
-  },[products, addToCart]);
+  },[addToCart]);
 
   const updateCartQty=useCallback((cartId:string, delta:number)=>{
     setCart((prev)=>{
@@ -312,7 +357,6 @@ export default function SalesPage(){
     });
   },[]);
 
-  // ✅ FINAL: Offline sale ka wapas aana band + stock fix
   const handleReturnSale = useCallback(async (sale: Sale) => {
     const qtyStr = window.prompt(`Return / Wapas qty?\n${sale.productName} - Sold x${sale.quantity}\n1 se ${sale.quantity} tak:`, "1");
     if(!qtyStr) return;
@@ -362,7 +406,6 @@ export default function SalesPage(){
         else res = await fetch(`/api/sales/${sale._id}`, { method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ quantity: newQty }) });
         const data = (await res.json()) as { error?: string };
         if(!res.ok) throw new Error(data.error || "Return failed");
-        // Delete all matching offline copies (local_ + server id)
         try{
           const all = await offlineDB.sales.toArray();
           const matches = all.filter(s=> s._id === sale._id || s.localId === sale._id || (s.productId === sale.productId && s.quantity === sale.quantity && s.total === sale.total));
@@ -427,14 +470,18 @@ export default function SalesPage(){
             <input ref={searchRef} value={productSearch} 
             onFocus={(e)=> e.target.select()} 
             onChange={(e)=>{ 
-              let val = e.target.value;
-              if(val.length > 20){
-                const matched = products.find(p => p.barcode && val.toLowerCase().endsWith(p.barcode.toLowerCase()));
-                if(matched?.barcode) val = matched.barcode;
-              }
-              setProductSearch(val); 
-              setProductPage(1);
-            }} placeholder="🔍 Scan barcode or name..." className="w-full border p-2.5 pr-10 rounded-xl bg-white text-[13px] outline-none focus:ring-2 focus:ring-black" />
+            const val = e.target.value;
+            if(val.length > 15){
+              const valNorm = normalizeBarcode(val);
+              // DB se direct dhoondho, products state se nahi
+              offlineDB.products.toArray().then(all=>{
+                const m = all.find(p=> normalizeBarcode(p.barcode||"") === valNorm || valNorm.endsWith(normalizeBarcode(p.barcode||"")));
+                if(m?.barcode) setProductSearch(m.barcode);
+              });
+            }
+            setProductSearch(val); 
+            setProductPage(1);
+          }} placeholder="🔍 Scan barcode or name..." className="w-full border p-2.5 pr-10 rounded-xl bg-white text-[13px] outline-none focus:ring-2 focus:ring-black" />
             {productSearch && (<button type="button" onClick={()=>{ setProductSearch(""); setProductPage(1); searchRef.current?.focus(); }} className="absolute right-2 top-1/2 -translate-y-1/2 bg-gray-200 hover:bg-black hover:text-white w-7 h-7 rounded-full flex items-center justify-center text-[12px] font-bold">✕</button>)}
           </div>
             <select value={categoryFilter} onChange={(e)=>{setCategoryFilter(e.target.value); setProductPage(1);}} className="border p-2.5 rounded-xl bg-white text-[12px]"><option value="all">All</option><option value="general">🛒 General</option><option value="mobile_accessories">📱 Mobile</option><option value="manyari">💍 Manyari</option><option value="cosmetics">💄 Cosmetics</option><option value="other">Other</option></select>
