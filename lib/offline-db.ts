@@ -50,14 +50,21 @@ export interface PendingReturn {
   createdAt: string;
   synced: number;
 }
+export interface PendingProductDelete {
+  id?: number;
+  productId: string;
+  localId: string;
+  createdAt: string;
+  synced: number;
+}
 export type OfflinePayload = OfflineSale | OfflineProduct | OfflineCustomer | WusoolSyncPayload | OfflineEasypaisa | DeleteCustomerPayload;
-export type SyncQueueType = "sale" | "product" | "customer" | "wusool" | "easypaisa" | "return" | "delete_customer";
+export type SyncQueueType = "sale" | "product" | "customer" | "wusool" | "easypaisa" | "return" | "delete_customer" | "delete_product";
 
 export interface SyncQueueItem {
   id?: number; 
   type: SyncQueueType;
   localId: string; 
-  payload: OfflinePayload | PendingReturn; 
+  payload: OfflinePayload | PendingReturn | PendingProductDelete; 
   createdAt: Date; 
   attempts: number;
 }
@@ -78,6 +85,7 @@ export class OfflineDB extends Dexie {
   easypaisa!: Table<OfflineEasypaisa, string>;
   syncQueue!: Table<SyncQueueItem, number>;
   pendingReturns!: Table<PendingReturn, number>;
+  pendingProductDeletes!: Table<PendingProductDelete, number>;
 
   constructor() {
     super("AsadStoreOfflineV2");
@@ -138,6 +146,17 @@ export class OfflineDB extends Dexie {
       easypaisa: "localId, _id, userId, synced, createdAt, type, customerName",
       syncQueue: "++id, type, localId, createdAt",
       pendingReturns: "++id, saleId, synced, createdAt",
+    });
+
+    // ✅ NEW VERSION 9 - delete sync fix
+    this.version(9).stores({
+      products: "localId, _id, userId, synced, name, category, barcode, createdAt",
+      sales: "localId, _id, productId, userId, synced, createdAt, customerName, status, category, paymentType",
+      customers: "localId, _id, name, normalizedName, userId, synced, totalUdhar, isPaid, createdAt",
+      easypaisa: "localId, _id, userId, synced, createdAt, type, customerName",
+      syncQueue: "++id, type, localId, createdAt",
+      pendingReturns: "++id, saleId, synced, createdAt",
+      pendingProductDeletes: "++id, productId, synced, createdAt",
     });
   }
 }
@@ -214,4 +233,21 @@ export async function savePendingReturn(saleId: string, newQty: number, retQty: 
     createdAt: new Date().toISOString(),
     synced: 0,
   });
+}
+
+// ✅ NEW - product delete queue
+export async function savePendingProductDelete(productId: string, localId: string): Promise<void> {
+  await offlineDB.pendingProductDeletes.add({
+    productId,
+    localId: localId || productId,
+    createdAt: new Date().toISOString(),
+    synced: 0,
+  });
+  // turant local cache se hatao
+  try{
+    await offlineDB.products.where('_id').equals(productId).delete();
+    await offlineDB.products.where('localId').equals(productId).delete();
+    await offlineDB.products.where('localId').equals(localId).delete();
+    await offlineDB.products.where('_id').equals(localId).delete();
+  }catch{}
 }

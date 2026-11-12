@@ -1,5 +1,5 @@
-import { offlineDB, calcProfit, calcTotal, savePendingReturn } from "./offline-db";
-import type { OfflineSale, OfflineEasypaisa, EasyType, SaleCategory, SyncQueueItem, WusoolSyncPayload, PendingReturn, DeleteCustomerPayload } from "./offline-db";
+import { offlineDB, calcProfit, calcTotal, savePendingReturn, savePendingProductDelete } from "./offline-db";
+import type { OfflineSale, OfflineEasypaisa, EasyType, SaleCategory, SyncQueueItem, WusoolSyncPayload, PendingReturn, DeleteCustomerPayload, PendingProductDelete } from "./offline-db";
 
 export interface SaleInput {
   productId: string;
@@ -202,11 +202,36 @@ export async function syncPendingReturns(): Promise<{ synced: number }> {
   return { synced };
 }
 
-export async function syncAllOffline(): Promise<{ sales: number; easypaisa: number; wusool: number; returns: number; deletes: number }> {
-  if (typeof window === "undefined" || !navigator.onLine) return { sales: 0, easypaisa: 0, wusool: 0, returns: 0, deletes: 0 };
+// ✅ NEW - Product Delete Sync
+export async function syncPendingProductDeletes(): Promise<{ synced: number }> {
+  if (typeof window === "undefined" || !navigator.onLine) return { synced: 0 };
+  const pending = await offlineDB.pendingProductDeletes.where("synced").equals(0).toArray() as PendingProductDelete[];
+  let synced = 0;
+  for (const r of pending) {
+    try {
+      const res = await fetch(`/api/products/${r.productId}`, { method: "DELETE" });
+      if (res.ok || res.status === 404) {
+        // double cleanup offline cache
+        try{
+          await offlineDB.products.where('_id').equals(r.productId).delete();
+          await offlineDB.products.where('localId').equals(r.productId).delete();
+          await offlineDB.products.where('localId').equals(r.localId).delete();
+        }catch{}
+        if (r.id) await offlineDB.pendingProductDeletes.delete(r.id);
+        else await offlineDB.pendingProductDeletes.where("productId").equals(r.productId).delete();
+        synced++;
+      }
+    } catch { /* ignore */ }
+  }
+  return { synced };
+}
+
+export async function syncAllOffline(): Promise<{ sales: number; easypaisa: number; wusool: number; returns: number; deletes: number; productDeletes: number }> {
+  if (typeof window === "undefined" || !navigator.onLine) return { sales: 0, easypaisa: 0, wusool: 0, returns: 0, deletes: 0, productDeletes: 0 };
   
   const salesResult = await syncOfflineSales();
   const returnsResult = await syncPendingReturns();
+  const productDeletesResult = await syncPendingProductDeletes();
   
   let easySynced = 0;
   const easy = await offlineDB.easypaisa.where("synced").equals(0).toArray();
@@ -236,7 +261,6 @@ export async function syncAllOffline(): Promise<{ sales: number; easypaisa: numb
       const cust = await offlineDB.customers.get(q.payload.customerLocalId);
       const customerName = cust?.name || q.payload.customerName || "";
       if (!customerName) continue;
-      // ✅ FIX: sahi endpoint /api/khata/wusool
       const res = await fetch("/api/khata/wusool", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -275,11 +299,15 @@ export async function syncAllOffline(): Promise<{ sales: number; easypaisa: numb
     }
   }catch{/* ignore */}
 
-  return { sales: salesResult.synced, easypaisa: easySynced, wusool: wusoolSynced, returns: returnsResult.synced, deletes: deleteSynced };
+  return { sales: salesResult.synced, easypaisa: easySynced, wusool: wusoolSynced, returns: returnsResult.synced, deletes: deleteSynced, productDeletes: productDeletesResult.synced };
 }
 
 export async function saveOfflineReturn(saleId: string, newQty: number, retQty: number, productId: string): Promise<void> {
   await savePendingReturn(saleId, newQty, retQty, productId);
+}
+
+export async function saveOfflineProductDelete(productId: string, localId: string): Promise<void> {
+  await savePendingProductDelete(productId, localId);
 }
 
 if (typeof window !== "undefined") {
