@@ -109,20 +109,28 @@ export default function SalesPage(){
     }catch{}
   },[refreshCounts]);
 
-  const cacheAllProductsOnce = useCallback(async()=>{
-    try{
-      const res = await fetch(`/api/products?search=&category=all&page=1&limit=500`);
+const cacheAllProductsOnce = useCallback(async()=>{
+  try{
+    const offlineUser = getOfflineUser() as OfflineUser;
+    const userId = offlineUser?._id || offlineUser?.id || "offline";
+    let page = 1, totalCached = 0, hasMore = true;
+    while(hasMore){
+      const res = await fetch(`/api/products?search=&category=all&page=${page}&limit=100`);
       const data = await res.json() as ProductApiResponse;
       const list = Array.isArray(data) ? data : data.products;
-      const offlineUser = getOfflineUser() as OfflineUser;
-      const userId = offlineUser?._id || offlineUser?.id || "offline";
+      const pag = Array.isArray(data) ? undefined : data.pagination;
+      if(!list || list.length===0) break;
       const toCache: OfflineProduct[] = list.map((p)=>({
         _id: p._id, localId: p._id, name: p.name, category: toCat(p.category), company: "", buyPrice: p.buyPriceAvg||p.buyPrice, buyPriceAvg: p.buyPriceAvg||p.buyPrice, sellPrice: p.sellPrice, stock: p.stock, stockMode: p.stockMode, barcode: p.barcode, userId, synced: 1, createdAt: new Date().toISOString(),
       }));
       await offlineDB.products.bulkPut(toCache);
-      alert(`Cached ${toCache.length} products for offline!`);
-    }catch{ alert("Cache failed"); }
-  },[]);
+      totalCached += toCache.length;
+      if(pag) hasMore = pag.hasMore; else hasMore = list.length===100;
+      page++; if(page>20) break;
+    }
+    alert(`Cached ${totalCached} products for offline!`);
+  }catch{ alert("Cache failed"); }
+},[]);
 
   const printBill = useCallback(async (cartItems: CartItem[], total: number, customer: string) => {
   const now = new Date();
